@@ -3,17 +3,43 @@ import pandas as pd
 from datetime import datetime, timedelta
 import sqlite3
 import io
+import os
 
-# --- 1. 数据库强化版 ---
+# --- 0. 安全与配置 ---
+st.set_page_config(page_title="NP Clinical Assistant", layout="wide", page_icon="👩‍⚕️")
+
+# 简单密码保护 (数据安全第一道防线)
+# 默认密码是 1234，你可以自己改
+def check_password():
+    if "password_correct" not in st.session_state:
+        st.session_state.password_correct = False
+
+    if st.session_state.password_correct:
+        return True
+
+    st.title("🔒 系统登录")
+    pwd = st.text_input("请输入密码 (Password)", type="password")
+    if st.button("登录"):
+        if pwd == "1213":  # <--- 在这里修改密码
+            st.session_state.password_correct = True
+            st.rerun()
+        else:
+            st.error("密码错误")
+    return False
+
+if not check_password():
+    st.stop()
+
+# --- 1. 数据库设置 ---
 def get_db_connection():
-    # 使用 check_same_thread=False 防止 Streamlit 多线程报错
     conn = sqlite3.connect('np_reminder.db', check_same_thread=False)
-    conn.row_factory = sqlite3.Row # 允许像字典一样访问列
+    conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
+    # 确保表格存在
     c.execute('''CREATE TABLE IF NOT EXISTS patients
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, dob TEXT, nursing_home TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS task_types
@@ -22,7 +48,7 @@ def init_db():
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, patient_id INTEGER, task_name TEXT, 
                   start_date TEXT, interval TEXT, due_date TEXT, status TEXT, notes TEXT)''')
     
-    # 初始化默认任务类型
+    # 预设数据 (如果任务类型为空则填充)
     c.execute("SELECT count(*) FROM task_types")
     if c.fetchone()[0] == 0:
         defaults = [
@@ -38,11 +64,9 @@ def init_db():
         conn.commit()
     return conn
 
-# 初始化数据库
 conn = init_db()
 
-# --- 2. 逻辑函数 ---
-
+# --- 2. 核心逻辑 ---
 def calculate_due_date(start_date, interval_str):
     start = pd.to_datetime(start_date)
     i_str = str(interval_str).lower().strip()
@@ -82,14 +106,14 @@ def get_next_stage_interval(task_name, current_interval):
     except:
         return None
 
-# --- 3. 页面布局 ---
-st.set_page_config(page_title="NP Clinical Assistant", layout="wide", page_icon="👩‍⚕️")
-
+# --- 3. 导航与页面 ---
 if 'page' not in st.session_state: st.session_state.page = "Dashboard"
 if 'prefill_task' not in st.session_state: st.session_state.prefill_task = None
 
-# 导航栏
 st.sidebar.title("👩‍⚕️ NP Assistant")
+st.sidebar.markdown(f"User: **NP Admin**")
+st.sidebar.markdown("---")
+
 def nav(p): st.session_state.page = p; st.session_state.prefill_task = None if p != "New Task" else st.session_state.prefill_task
 
 st.sidebar.button("📊 仪表盘 (Dashboard)", on_click=nav, args=("Dashboard",), use_container_width=True)
@@ -97,125 +121,125 @@ st.sidebar.button("➕ 新建提醒 (New Task)", on_click=nav, args=("New Task",
 st.sidebar.button("👤 病人管理 (Patients)", on_click=nav, args=("Patients",), use_container_width=True)
 st.sidebar.button("📂 Excel 备份", on_click=nav, args=("Excel",), use_container_width=True)
 st.sidebar.markdown("---")
-st.sidebar.button("🔧 调试/诊断 (Debug)", on_click=nav, args=("Debug",), use_container_width=True)
+st.sidebar.button("⚙️ 系统设置 (Reset)", on_click=nav, args=("Settings",), use_container_width=True)
 
 # ================= DASHBOARD =================
 if st.session_state.page == "Dashboard":
     st.title("📅 待办事项看板")
     
-    # 强制重新读取数据库，确保数据最新
+    # 获取数据
     df = pd.read_sql_query("""
-        SELECT r.id, p.name, p.nursing_home, r.task_name, r.interval, r.due_date, r.notes, r.patient_id, r.status
+        SELECT r.id, p.name, p.nursing_home, r.task_name, r.interval, r.due_date, r.notes, r.patient_id
         FROM reminders r
         LEFT JOIN patients p ON r.patient_id = p.id
         WHERE r.status = 'Pending'
     """, conn)
     
     if df.empty:
-        st.info("👋 目前没有 'Pending' 状态的任务。请去 '新建提醒' 试着加一个。")
+        st.info("👋 暂无待办任务。请去新建任务。")
     else:
-        # 数据清洗：确保日期格式正确
         df['due_date'] = pd.to_datetime(df['due_date']).dt.date
         today = datetime.now().date()
-        next_week = today + timedelta(days=7)
         
-        # 顶部过滤器
-        col_view1, col_view2 = st.columns([1, 4])
-        # 默认改为 True (显示所有)，防止因为日期计算错误导致你看不到数据
-        show_all = col_view1.checkbox("显示所有待办 (Show All)", value=True)
+        # 顶部选项
+        col1, col2 = st.columns([1, 4])
+        show_all = col1.checkbox("显示所有任务", value=True)
         
-        # 筛选
-        if show_all:
-            df_display = df
-        else:
-            df_display = df[df['due_date'] <= next_week]
-            
-        # 排序
-        df_display = df_display.sort_values(by=['nursing_home', 'due_date'])
+        # 筛选与排序
+        if not show_all:
+            df = df[df['due_date'] <= today + timedelta(days=7)]
         
-        if df_display.empty:
-            st.warning("本周内没有任务 (勾选 '显示所有' 查看远期任务)")
-        else:
-            # 分组显示逻辑
-            # 处理 nursing_home 可能为 None 的情况
-            df_display['nursing_home'] = df_display['nursing_home'].fillna("未分类 (Unknown Location)")
-            unique_homes = df_display['nursing_home'].unique()
+        df = df.sort_values(by=['nursing_home', 'due_date'])
+        
+        # 统计
+        n_overdue = len(df[df['due_date'] < today])
+        n_urgent = len(df[(df['due_date'] >= today) & (df['due_date'] <= today + timedelta(days=3))])
+        col2.markdown(f"🔴 逾期: **{n_overdue}** | 🟠 紧急(3天内): **{n_urgent}**")
+        
+        # 分组展示
+        df['nursing_home'] = df['nursing_home'].fillna("未分类")
+        homes = df['nursing_home'].unique()
+        
+        for home in homes:
+            st.markdown(f"### 🏥 {home}")
+            home_tasks = df[df['nursing_home'] == home]
             
-            st.write(f"共找到 {len(df_display)} 个待办任务：")
-            
-            for home in unique_homes:
-                st.markdown(f"### 🏥 {home}")
-                home_tasks = df_display[df_display['nursing_home'] == home]
+            for _, row in home_tasks.iterrows():
+                # --- 颜色逻辑 ---
+                days_left = (row['due_date'] - today).days
                 
-                for idx, row in home_tasks.iterrows():
-                    # 状态图标
-                    is_overdue = row['due_date'] < today
-                    icon = "🔴" if is_overdue else "📅"
+                if days_left < 0:
+                    status_color = "🔴" # 逾期
+                    bg_msg = f"已逾期 {abs(days_left)} 天!"
+                elif days_left <= 3:
+                    status_color = "🟠" # 紧急
+                    bg_msg = f"剩 {days_left} 天"
+                else:
+                    status_color = "🟢" # 安全
+                    bg_msg = "远期规划"
+                
+                # 卡片标题
+                card_title = f"{status_color} **{row['name']}** - {row['task_name']} ({row['interval']})"
+                
+                with st.expander(card_title):
+                    st.caption(f"截止: **{row['due_date']}** | 状态: {bg_msg}")
+                    if row['notes']: st.info(f"备注: {row['notes']}")
                     
-                    with st.expander(f"{icon} {row['due_date']} | {row['name']} - {row['task_name']}"):
-                        st.write(f"**周期**: {row['interval']} | **备注**: {row['notes']}")
+                    c1, c2, c3 = st.columns([1, 2, 2])
+                    if c1.button("✅ 完成", key=f"d_{row['id']}"):
+                        conn.execute("UPDATE reminders SET status='Done' WHERE id=?", (row['id'],))
+                        conn.commit()
+                        st.rerun()
                         
-                        c1, c2, c3 = st.columns([1, 2, 2])
+                    if c2.button("🔄 循环 (Repeat)", key=f"r_{row['id']}"):
+                        conn.execute("UPDATE reminders SET status='Done' WHERE id=?", (row['id'],))
+                        conn.commit()
+                        st.session_state.prefill_task = {"patient_name": row['name'], "nursing_home": row['nursing_home'], "task_name": row['task_name'], "next_interval": row['interval'], "mode": "repeat"}
+                        st.session_state.page = "New Task"
+                        st.rerun()
                         
-                        # 按钮逻辑
-                        if c1.button("✅ 完成", key=f"d_{row['id']}"):
+                    nxt = get_next_stage_interval(row['task_name'], row['interval'])
+                    if nxt:
+                        if c3.button(f"➡️ 进阶 ({nxt})", key=f"n_{row['id']}"):
                             conn.execute("UPDATE reminders SET status='Done' WHERE id=?", (row['id'],))
                             conn.commit()
-                            st.rerun()
-                            
-                        if c2.button(f"🔄 循环 ({row['interval']})", key=f"r_{row['id']}"):
-                            conn.execute("UPDATE reminders SET status='Done' WHERE id=?", (row['id'],))
-                            conn.commit()
-                            st.session_state.prefill_task = {"patient_name": row['name'], "nursing_home": row['nursing_home'], "task_name": row['task_name'], "next_interval": row['interval'], "mode": "repeat"}
+                            st.session_state.prefill_task = {"patient_name": row['name'], "nursing_home": row['nursing_home'], "task_name": row['task_name'], "next_interval": nxt, "mode": "stage"}
                             st.session_state.page = "New Task"
                             st.rerun()
-                            
-                        nxt = get_next_stage_interval(row['task_name'], row['interval'])
-                        if nxt:
-                            if c3.button(f"➡️ 进阶 ({nxt})", key=f"n_{row['id']}"):
-                                conn.execute("UPDATE reminders SET status='Done' WHERE id=?", (row['id'],))
-                                conn.commit()
-                                st.session_state.prefill_task = {"patient_name": row['name'], "nursing_home": row['nursing_home'], "task_name": row['task_name'], "next_interval": nxt, "mode": "stage"}
-                                st.session_state.page = "New Task"
-                                st.rerun()
-                st.divider()
+            st.divider()
 
 # ================= NEW TASK =================
 elif st.session_state.page == "New Task":
     st.title("🔔 创建任务")
     prefill = st.session_state.prefill_task
-    if prefill: st.info(f"正在为 {prefill['patient_name']} 创建新任务...")
+    if prefill: st.info(f"正在为 {prefill['patient_name']} 创建: {prefill.get('mode', 'new')} 任务")
 
     nh_list = pd.read_sql_query("SELECT DISTINCT nursing_home FROM patients WHERE nursing_home IS NOT NULL AND nursing_home != ''", conn)['nursing_home'].tolist()
     
     if not nh_list:
         st.error("请先在 '病人管理' 添加病人！")
     else:
-        # 1. 选养老院
         idx_nh = 0
         if prefill and prefill.get('nursing_home') in nh_list: idx_nh = nh_list.index(prefill.get('nursing_home'))
         sel_nh = st.selectbox("养老院", nh_list, index=idx_nh)
         
-        # 2. 选病人
         pts = pd.read_sql_query("SELECT id, name FROM patients WHERE nursing_home = ?", conn, params=(sel_nh,))
         if pts.empty:
-            st.warning("该养老院下没有病人。")
+            st.warning("无病人数据")
         else:
             p_names = pts['name'].tolist()
             idx_pt = 0
             if prefill and prefill.get('patient_name') in p_names: idx_pt = p_names.index(prefill.get('patient_name'))
             sel_pt = st.selectbox("病人", p_names, index=idx_pt)
-            # 强制转为 int，确保 ID 格式正确
             sel_pt_id = int(pts[pts['name']==sel_pt]['id'].values[0])
             
             st.divider()
             
-            # 3. 任务细节
             tasks = pd.read_sql_query("SELECT * FROM task_types", conn)
             t_names = tasks['name'].tolist()
             idx_t = 0
             if prefill and prefill.get('task_name') in t_names: idx_t = t_names.index(prefill.get('task_name'))
-            sel_task = st.selectbox("复查项目", t_names, index=idx_t)
+            sel_task = st.selectbox("项目", t_names, index=idx_t)
             
             raw_int = tasks[tasks['name']==sel_task]['default_intervals'].values[0]
             opts = [x.strip() for x in raw_int.split(',')] + ["Custom"]
@@ -232,22 +256,15 @@ elif st.session_state.page == "New Task":
             start_date = st.date_input("开始日期", datetime.now())
             due_date = calculate_due_date(start_date, final_int)
             
-            st.markdown(f"#### 截止日期: {due_date}")
+            st.markdown(f"#### 🗓️ 截止: :red[{due_date}]")
             notes = st.text_area("备注")
             
-            if st.button("💾 确认保存", type="primary"):
-                try:
-                    # 显式打印调试信息到后台 (如果是本地运行可以看到)
-                    print(f"Saving: PID={sel_pt_id}, Task={sel_task}, Due={due_date}")
-                    conn.execute("""
-                        INSERT INTO reminders (patient_id, task_name, start_date, interval, due_date, status, notes) 
-                        VALUES (?, ?, ?, ?, ?, 'Pending', ?)
-                    """, (sel_pt_id, sel_task, str(start_date), final_int, str(due_date), notes))
-                    conn.commit()
-                    st.success("✅ 保存成功！请去 Dashboard 查看。")
-                    st.session_state.prefill_task = None
-                except Exception as e:
-                    st.error(f"保存失败: {e}")
+            if st.button("💾 保存任务", type="primary"):
+                conn.execute("INSERT INTO reminders (patient_id, task_name, start_date, interval, due_date, status, notes) VALUES (?,?,?,?,?,?,?)",
+                             (sel_pt_id, sel_task, str(start_date), final_int, str(due_date), 'Pending', notes))
+                conn.commit()
+                st.success("✅ 保存成功！")
+                st.session_state.prefill_task = None
 
 # ================= PATIENTS =================
 elif st.session_state.page == "Patients":
@@ -263,14 +280,11 @@ elif st.session_state.page == "Patients":
                 conn.commit()
                 st.success("已添加")
                 st.rerun()
-            else:
-                st.error("姓名和养老院必填")
-    
     st.dataframe(pd.read_sql_query("SELECT * FROM patients", conn), use_container_width=True)
 
 # ================= EXCEL =================
 elif st.session_state.page == "Excel":
-    st.title("📂 Excel 备份")
+    st.title("📂 数据备份")
     if st.button("下载数据"):
         df_r = pd.read_sql_query("SELECT * FROM reminders", conn)
         df_p = pd.read_sql_query("SELECT * FROM patients", conn)
@@ -280,44 +294,34 @@ elif st.session_state.page == "Excel":
             df_p.to_excel(writer, sheet_name='Patients', index=False)
         st.download_button("下载 .xlsx", output.getvalue(), "backup.xlsx")
         
-    st.markdown("---")
-    st.subheader("导入病人")
+    st.subheader("导入")
     up = st.file_uploader("上传 Excel", type=['xlsx'])
     if up:
         df = pd.read_excel(up)
-        # 简单处理列名
         df.columns = [c.lower().strip() for c in df.columns]
         if 'name' in df.columns:
-            count = 0
             for _, r in df.iterrows():
                 nh = r['nursing_home'] if 'nursing_home' in df.columns else "Unknown"
                 conn.execute("INSERT INTO patients (name, dob, nursing_home) VALUES (?,?,?)", (r['name'], "1950-01-01", nh))
-                count += 1
             conn.commit()
-            st.success(f"导入 {count} 人")
+            st.success("导入成功")
 
-# ================= DEBUG (新功能) =================
-elif st.session_state.page == "Debug":
-    st.title("🔧 数据库诊断面板")
-    st.error("此页面用于检查数据是否真实存在。")
+# ================= SETTINGS (RESET) =================
+elif st.session_state.page == "Settings":
+    st.title("⚙️ 系统设置")
     
-    st.subheader("1. 原始提醒表 (Reminders)")
-    df_r = pd.read_sql_query("SELECT * FROM reminders", conn)
-    st.dataframe(df_r)
-    st.caption(f"共 {len(df_r)} 条记录。如果这里是空的，说明 '保存' 步骤失败了。")
+    st.warning("⚠️ 危险区域：重置数据库将清空所有数据！")
+    st.write("如果发现数据乱码、无法显示，或者想重新开始，请点击下方按钮。")
     
-    st.subheader("2. 原始病人表 (Patients)")
-    df_p = pd.read_sql_query("SELECT * FROM patients", conn)
-    st.dataframe(df_p)
-    
-    st.subheader("3. 联表查询测试")
-    st.write("模拟 Dashboard 的查询逻辑：")
-    query = """
-        SELECT r.id, p.name, p.nursing_home, r.task_name, r.due_date, r.status
-        FROM reminders r
-        LEFT JOIN patients p ON r.patient_id = p.id
-    """
-    df_join = pd.read_sql_query(query, conn)
-    st.dataframe(df_join)
-    
-    st.info("如果上面的 '联表查询' 里的 name 是 NaN (空的)，说明 patient_id 对不上。")
+    # 双重确认
+    if st.checkbox("我确定要清空所有数据"):
+        if st.button("🔴 重置/清空所有数据", type="primary"):
+            try:
+                # 关闭连接
+                conn.close()
+                # 删除文件
+                if os.path.exists("np_reminder.db"):
+                    os.remove("np_reminder.db")
+                st.success("数据库已删除。请刷新页面，系统将自动重建空表。")
+            except Exception as e:
+                st.error(f"重置失败: {e}")
